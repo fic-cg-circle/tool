@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!-- サークル管理ツールのアイコン。白地の真ん中に○、その中に✓。✓の右上は○からはみ出す -->
+  <rect width="512" height="512" fill="#ffffff"/>
+  <circle cx="256" cy="256" r="150" fill="none" stroke="#1d1d1f" stroke-width="30"/>
+  <!-- ✓の下に白い縁を敷いて、○を突き抜けたところで線が切れて見えるようにする -->
+  <path d="M178 262 L242 324 L432 96" fill="none" stroke="#ffffff" stroke-width="84" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M178 262 L242 324 L432 96" fill="none" stroke="#0071e3" stroke-width="44" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
