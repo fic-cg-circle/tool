@@ -4,7 +4,7 @@
    どちらで動いているかは、Google が入れてくれる google.script があるかで見分ける */
 const IN_GAS = typeof google !== 'undefined' && !!(google.script && google.script.run);
 // プログラムの版。サーバー(Code.gs)の CODE_VERSION と同じにしておく
-const CODE_VERSION = '2026-10-06c';
+const CODE_VERSION = '2026-10-07b';
 
 /* ---------- 読み込み中の画面で止まったままにしない ----------
    思わぬエラーや、サーバーの返事が来ないときに、アイコンが回り続けるだけにならないよう、
@@ -76,7 +76,8 @@ const icon = (n, cls) => `<svg class="ic ${cls || ''}" viewBox="0 0 24 24" aria-
 let S = null;            // サーバーから取ってきたデータ
 let tab = 'att';
 let curDate = null;
-const chkCur = {};       // 提出チェックで開いている回(感想=締切日の水曜 / 提出物=活動日)
+const chkCur = {};       // 提出チェックで開いている回(感想=締切日の水曜 / 提出物=活動日 / 臨時課題=課題ID)
+let subMode = 'sub';     // 提出物タブ: 毎回の提出物(sub) / 臨時の課題(task)
 let memoKind = '共有';   // 共有 / フィードバック / 個人
 const forms = {};        // メモ入力欄の中身(種類ごと)
 let memoFilter = {tag:'', target:'', fb:''};
@@ -193,6 +194,10 @@ function ingest(d){
   S.att = {};
   d.attendance.forEach(a => { (S.att[a.date] = S.att[a.date] || {})[a.id] = a; });
   // 未送信の変更は画面上に残す
+  S.taskBy = {};
+  S.over = {sub:{}, kan:{}};   // その回だけ出す人を変えたもの
+  (d.targetOverrides || []).forEach(o => { if (S.over[o.kind]) S.over[o.kind][o.key] = o.rule; });
+  (d.tasks || []).forEach(t => S.taskBy[t.id] = t);
   S.chk = {};
   Object.keys(CHK).forEach(k => {
     S.chk[k] = {};
@@ -442,8 +447,10 @@ const CHK = {
     cfg: () => S.submitCfg, data: () => S.submit,
     keys: () => subDays(), def: () => { const ks = subDays(); return ks.find(x => x >= S.today) || ks[ks.length - 1] || null; },
     deadline: d => Date.parse(`${addDays(d, -S.submitCfg.daysBefore)}T${S.submitCfg.time}:00+09:00`),
-    opt: d => `${fmtDate(d)} ${S.dayBy[d] ? noLabel(S.dayBy[d]) : ''} ・締切 ${fmtDate(addDays(d, -S.submitCfg.daysBefore))} ${S.submitCfg.time}`,
+    opt: d => `${fmtDate(d)} ${S.dayBy[d] ? noLabel(S.dayBy[d]) : ''}${S.dayBy[d] && S.dayBy[d].wk ? ' ' + S.dayBy[d].wk + '週' : ''} ・締切 ${fmtDate(addDays(d, -S.submitCfg.daysBefore))} ${S.submitCfg.time}`,
     lead: () => `活動日の${S.submitCfg.daysBefore === 1 ? '前日' : S.submitCfg.daysBefore + '日前'} ${S.submitCfg.time} 締め切り。出した人に印を付けます。`,
+    target: k => S.over && S.over.sub[k] || (S.targets ? S.targets.sub : null),
+    wk: k => (S.dayBy[k] || {}).wk || '',
   },
   kan: {
     fn: 'saveKanso', en: 'Reviews', ja: '映画の感想', what: '感想', unit: '週',
@@ -452,8 +459,42 @@ const CHK = {
     deadline: w => Date.parse(`${w}T${S.kansoCfg.time}:00+09:00`),
     opt: w => `${fmtDate(w)} ${S.kansoCfg.time} 締切`,
     lead: () => `毎週水曜 ${S.kansoCfg.time} 締め切り。Teamsの投稿を見て、出した人に印を付けます。`,
+    target: k => S.over && S.over.kan[k] || (S.targets ? S.targets.kan : null),
+    wk: k => (S.dayBy[k] || {}).wk || '',   // その水曜の活動日のA週/B週
+  },
+  task: {
+    fn: 'saveTaskChecks', en: 'Assignments', ja: '臨時の課題', what: '課題', unit: '課題', noOff: true,
+    cfg: () => S.tasks, data: () => S.taskChecks,
+    keys: () => (S.tasks || []).map(t => t.id),
+    def: () => { const ts = S.tasks || []; return ((ts.find(t => taskDeadline(t) >= Date.now()) || ts[ts.length - 1]) || {}).id || null; },
+    deadline: id => taskDeadline(S.taskBy[id]),
+    opt: id => { const t = S.taskBy[id]; return `${t.title}(${fmtDate(t.date)} ${t.time} 締切)`; },
+    lead: () => '臨時で出す課題です。課題ごとに、締め切りと出す人を決められます。',
+    target: id => S.taskBy[id] ? S.taskBy[id].rule : null,
+    wk: () => '',
   },
 };
+const taskDeadline = t => t ? Date.parse(`${t.date}T${t.time}:00+09:00`) : 0;
+/**
+ * 出す人の決まり(学年+個別に足す−個別に外す)に、その部員が入るか。決まりが無ければ全員。
+ * byWeek なら、A週の回(wk='A')はA班・B週の回はB班だけ。班の無い人と、A/B週でない回は分けない
+ */
+function inRule(m, rule, wk){
+  if (!rule) return true;
+  if (rule.exclude.includes(m.id)) return false;
+  if (!(rule.grades.includes(String(m.grade)) || rule.include.includes(m.id))) return false;
+  return !(rule.byWeek && wk && m.group && m.group !== wk);
+}
+/** 決まりを短い文に(例: 1年 +2年A −1年C ・A週はA班だけ) */
+function ruleText(rule, wk){
+  if (!rule) return '全員';
+  const n = activeMembers().filter(m => inRule(m, rule, wk)).length;
+  const parts = rule.grades.slice().sort().map(g => g + '年');
+  rule.include.forEach(id => S.byId[id] && parts.push('+' + S.byId[id].name));
+  rule.exclude.forEach(id => S.byId[id] && parts.push('−' + S.byId[id].name));
+  const split = rule.byWeek ? (wk ? ` ・${wk}週は${wk}班だけ` : ' ・A週/B週で分ける') : '';
+  return `${parts.join(' ') || 'なし'}${split}(${n}人)`;
+}
 function applyChk(kind, key, id, status){
   const w = S.chk[kind][key] = S.chk[kind][key] || {};
   if (status) w[id] = {key, id, status, by:S.me.name, at:''};
@@ -624,9 +665,9 @@ function picHtml(id){
 function render(){
   $('#who').textContent = `${S.me.name}(${S.me.role})`;
   document.querySelectorAll('#tabs button').forEach(b => b.classList.toggle('on', b.dataset.tab === tab));
-  $('#view').innerHTML = ({att:viewAtt, sub:() => viewChk('sub'), kan:() => viewChk('kan'), sum:viewSum, memo:viewMemo, set:viewSet})[tab]();
+  $('#view').innerHTML = ({att:viewAtt, sub:() => viewChk(subMode), kan:() => viewChk('kan'), sum:viewSum, memo:viewMemo, set:viewSet})[tab]();
   renderBell();
-  if (tab === 'att' || CHK[tab]) setSave(setSave.text || '', setSave.err);
+  if (tab === 'att' || tab === 'sub' || tab === 'kan') setSave(setSave.text || '', setSave.err);
   hydrateImages();
 }
 
@@ -693,14 +734,21 @@ function viewAtt(){
 
 function viewChk(kind){
   const C = CHK[kind];
-  if (!C.cfg()) return sec(C.en, C.ja) + '<p class="empty">サーバー(Apps Script)のコードを最新にすると使えます。</p>';
+  const ed = canEdit();
+  // 提出物タブは、毎回の提出物と臨時の課題を切り替える
+  const seg = kind === 'kan' ? '' : `<div class="segtabs">${[['sub', '毎回の提出物', ''], ['task', '臨時の課題', (S.tasks || []).length]].map(([k, l, n]) =>
+    `<button data-act="subMode" data-k="${k}" class="${kind === k ? 'on' : ''}">${l}${n !== '' ? `<small>${n}</small>` : ''}</button>`).join('')}</div>`;
+  if (!C.cfg()) return sec(C.en, C.ja) + seg + '<p class="empty">サーバー(Apps Script)のコードを最新にすると使えます。</p>';
   const keys = C.keys();
   const k = chkCur[kind];
   const i = keys.indexOf(k);
-  let h = sec(C.en, C.ja, esc(C.lead()));
-  if (!k) return h + `<p class="empty">まだ${kind === 'sub' ? '活動日' : '週'}がありません。</p>`;
-  const ed = canEdit();
-  const members = activeMembers();
+  let h = sec(C.en, C.ja, esc(C.lead())) + seg;
+  if (kind === 'task' && ed) h += `<div class="row" style="margin-bottom:10px">${k ? `<button class="btn sm" data-act="taskEdit" data-id="${esc(k)}">${icon('edit', 'sm')}この課題を編集</button>` : ''}<span class="grow"></span><button class="btn sm primary" data-act="taskEdit">${icon('plus', 'sm')}新しい課題</button></div>`;
+  if (!k) return h + `<p class="empty">${kind === 'task' ? '臨時の課題はまだありません。' : `まだ${kind === 'sub' ? '活動日' : '週'}がありません。`}</p>`;
+  const rule = C.target(k), wk = C.wk(k);
+  const all = activeMembers();
+  const members = all.filter(m => inRule(m, rule, wk));
+  const over = kind !== 'task' && S.over && S.over[kind][k];
   const rec = S.chk[kind][k] || {};
   const closed = chkClosed(kind, k);
   h += `<div class="daybar">
@@ -709,6 +757,12 @@ function viewChk(kind){
       `<option value="${x}" ${x === k ? 'selected' : ''}>${esc(C.opt(x))}${chkOff(kind, x) ? '(なし)' : ''}</option>`).join('')}</select>
     <button class="iconbtn" data-act="chkNext" data-k="${kind}" ${i >= keys.length - 1 ? 'disabled' : ''} aria-label="次">${icon('right')}</button>
   </div>`;
+  const task = kind === 'task' ? S.taskBy[k] : null;
+  h += `<div class="dayinfo" style="margin-bottom:0">${wkBadge(wk)}${over ? '<span class="badge plan">この回だけ変更</span>' : ''}<span class="small">出す人: <b>${esc(ruleText(rule, wk))}</b></span></div>`;
+  if (ed && kind !== 'task') h += `<div class="row" style="gap:12px;margin-top:2px">
+    <button class="linkbtn" data-act="tgEdit" data-k="${kind}" data-key="${esc(k)}">この${C.unit}だけ変える</button>
+    <button class="linkbtn" data-act="tgEdit" data-k="${kind}">いつもの出す人を変える</button></div>`;
+  if (task && task.note) h += `<div class="muted small">${esc(task.note)}</div>`;
   if (chkOff(kind, k)) {
     return h + `<div class="notice">この${C.unit}は${C.what}を出さなくていい${C.unit}にしてあります。${ed ? `<div class="row" style="margin-top:8px"><button class="btn sm" data-act="chkOff" data-k="${kind}">${C.what}ありに戻す</button></div>` : ''}</div>`;
   }
@@ -731,8 +785,8 @@ function viewChk(kind){
     });
     h += `</div>`;
   });
-  if (!members.length) h += '<p class="empty">在籍中の部員がいません。</p>';
-  if (ed) h += `<div class="row" style="margin-top:14px"><button class="btn sm" data-act="chkOff" data-k="${kind}">この${C.unit}は${C.what}なしにする</button></div>`;
+  if (!members.length) h += '<p class="empty">出す人がいません。「変更」から選んでください。</p>';
+  if (ed && !C.noOff) h += `<div class="row" style="margin-top:14px"><button class="btn sm" data-act="chkOff" data-k="${kind}">この${C.unit}は${C.what}なしにする</button></div>`;
   return h;
 }
 
@@ -741,10 +795,14 @@ function chkStats(kind){
   const keys = CHK[kind].cfg() ? CHK[kind].keys().filter(k => chkClosed(kind, k) && !chkOff(kind, k)) : [];
   const out = {};
   activeMembers().forEach(m => {
-    let on = 0, late = 0;
-    keys.forEach(k => { const r = (S.chk[kind][k] || {})[m.id]; if (r && r.status === '提出') on++; else if (r && r.status === '遅れ') late++; });
+    let on = 0, late = 0, due = 0;
+    keys.forEach(k => {
+      if (!inRule(m, CHK[kind].target(k), CHK[kind].wk(k))) return;   // 出す人でない回は数えない
+      due++;
+      const r = (S.chk[kind][k] || {})[m.id]; if (r && r.status === '提出') on++; else if (r && r.status === '遅れ') late++;
+    });
     // 提出率は、遅れて出した分も「出した」に数える(遅れは別に表示する)
-    out[m.id] = {on, late, due: keys.length, rate: keys.length ? Math.round((on + late) / keys.length * 100) : null};
+    out[m.id] = {on, late, due, rate: due ? Math.round((on + late) / due * 100) : null};
   });
   return out;
 }
@@ -785,7 +843,7 @@ function computeStats(){
 
 function viewSum(){
   const st = computeStats();
-  const ss = chkStats('sub'), ks = chkStats('kan');
+  const ss = chkStats('sub'), ks = chkStats('kan'), ts = chkStats('task');
   const warn = st.filter(x => x.streak >= 2);
   const rated = st.filter(x => x.rate != null);
   const avg = rated.length ? Math.round(rated.reduce((n, x) => n + x.rate, 0) / rated.length) : null;
@@ -806,16 +864,16 @@ function viewSum(){
     }).join('')}
   </div>`;
   h += `<h2 class="sub">部員ごとの集計</h2><div class="tablewrap"><table>
-    <tr><th class="name">名前</th><th>出席率</th><th>報告</th><th>提出物<br><small>提出率</small></th><th>感想<br><small>提出率</small></th>${S.statuses.map(s => `<th title="${s}"><span class="k${KEY[s]}" style="display:inline-block;width:22px;height:22px;line-height:22px;border-radius:50%">${SYMBOL[s]}</span></th>`).join('')}<th>記録</th></tr>`;
+    <tr><th class="name">名前</th><th>出席率</th><th>報告</th><th>提出物<br><small>提出率</small></th><th>感想<br><small>提出率</small></th><th>臨時課題<br><small>提出率</small></th>${S.statuses.map(s => `<th title="${s}"><span class="k${KEY[s]}" style="display:inline-block;width:22px;height:22px;line-height:22px;border-radius:50%">${SYMBOL[s]}</span></th>`).join('')}<th>記録</th></tr>`;
   st.forEach(x => {
     h += `<tr><td class="name">${esc(x.m.name)} ${grpChip(x.m.group)}${x.m.note ? `<div class="pnote">${esc(x.m.note)}</div>` : ''}</td>
       <td class="rate ${x.rate != null && x.rate < 60 ? 'low' : ''}">${x.rate == null ? '-' : x.rate + '%'}</td>
       <td>${x.m.group ? `${x.reported}/${x.due}` : (x.reported || '')}</td>
-      <td>${chkCell(ss[x.m.id])}</td><td>${chkCell(ks[x.m.id])}</td>
+      <td>${chkCell(ss[x.m.id])}</td><td>${chkCell(ks[x.m.id])}</td><td>${chkCell(ts[x.m.id])}</td>
       ${S.statuses.map(s => `<td>${x.c[s] || ''}</td>`).join('')}<td class="muted">${x.recorded}</td></tr>`;
   });
   h += `</table></div>
-    <p class="muted small">○出席 遅=遅刻 早=早退 学=学校を欠席・早退 欠=サークルだけ欠席 / 報告=済み÷自分の班の週の回数(今日まで) / 提出物・感想の提出率=出した数(遅れも含む)÷締め切りが過ぎた回の数</p>`;
+    <p class="muted small">○出席 遅=遅刻 早=早退 学=学校を欠席・早退 欠=サークルだけ欠席 / 報告=済み÷自分の班の週の回数(今日まで) / 提出率=出した数(遅れも含む)÷締め切りが過ぎた回のうち、その人が出す人だった回の数。「-」は対象の回がまだない</p>`;
 
   const members = activeMembers();
   const days = S.days.filter(d => takesAtt(d) && (d.date <= S.today || members.some(m => S.att[d.date] && S.att[d.date][m.id])));
@@ -1263,6 +1321,77 @@ function openDayEditor(date){
     </div></div>`;
   $('#sheet').classList.add('show');
 }
+/* ---------- 出す人を選ぶ ---------- */
+function pickerHtml(rule){
+  const n = activeMembers().filter(m => inRule(m, rule)).length;
+  let h = `<div class="small" style="margin-bottom:6px">学年を押すとその学年全員、名前を押すとその人だけを切り替えます。<b>${n}人</b></div>`;
+  byGrade(activeMembers()).forEach(([g, list]) => {
+    h += `<div class="pick"><button class="rep ${rule.grades.includes(String(g)) ? 'on' : ''}" data-act="tgGrade" data-g="${esc(g)}">${esc(g)}年 全員</button>
+      ${list.map(m => `<button class="rep ${inRule(m, rule) ? 'on' : ''}" data-act="tgMem" data-id="${esc(m.id)}">${esc(m.name)}</button>`).join('')}</div>`;
+  });
+  return h;
+}
+function toggleGrade(rule, g){
+  const ids = activeMembers().filter(m => String(m.grade) === String(g)).map(m => m.id);
+  if (rule.grades.includes(String(g))) { rule.grades = rule.grades.filter(x => x !== String(g)); rule.include = rule.include.filter(id => !ids.includes(id)); }
+  else { rule.grades.push(String(g)); rule.exclude = rule.exclude.filter(id => !ids.includes(id)); }
+}
+function toggleMem(rule, id){
+  const m = S.byId[id];
+  const tog = (list, x) => list.includes(x) ? list.filter(y => y !== x) : list.concat([x]);
+  if (rule.grades.includes(String(m.grade))) rule.exclude = tog(rule.exclude, id);
+  else rule.include = tog(rule.include, id);
+}
+const cloneRule = r => ({grades:[...(r ? r.grades : [])], include:[...(r ? r.include : [])], exclude:[...(r ? r.exclude : [])], byWeek:!!(r && r.byWeek)});
+function openSheet(title, body, foot){
+  $('#sheet').innerHTML = `<div class="panel" role="dialog" aria-modal="true">
+    <div class="head"><h3>${title}</h3><button class="iconbtn" data-act="closeSheet" aria-label="閉じる">${icon('close')}</button></div>
+    <div class="body">${body}</div><div class="foot">${foot}</div></div>`;
+  $('#sheet').classList.add('show');
+}
+/**
+ * 毎回の提出物・感想の、出す人を変える。
+ * key なし=いつもの設定(すべての回) / key あり=その回だけ
+ */
+function openTargetEditor(kind, key){
+  const C = CHK[kind];
+  const base = S.targets ? S.targets[kind] : null;
+  const over = key && S.over[kind][key];
+  sheet = {kind:'target', chk:kind, key:key || '', rule:cloneRule(key ? C.target(key) : base)};
+  sheet.rule.byWeek = !!(key ? C.target(key) : base || {}).byWeek;
+  const wk = key ? C.wk(key) : '';
+  openSheet(key ? `${esc(C.opt(key))} だけ` : `いつもの${C.ja}を出す人`, `
+    ${key ? `<p class="small" style="margin-top:0">この${C.unit}だけ出す人を変えます。ほかの${C.unit}は「いつもの設定」のままです。</p>` : ''}
+    <div id="tPick">${pickerHtml(sheet.rule)}</div>
+    <div class="toggles"><label class="toggle"><span class="tx">A週はA班、B週はB班だけ<small>班の無い人(2年など)と、A/B週でない回は分けない${wk ? `。この回は${wk}週` : ''}</small></span>
+      <input type="checkbox" class="sw" id="tgWeek" ${sheet.rule.byWeek ? 'checked' : ''}></label></div>
+    <p class="muted small">${key ? '' : '学年で選んでおくと、新年度に学年が上がっても、その年の学年の人になります。変えると、これまでの回の提出率もこの人たちで数え直します(「この回だけ」変えた回はそのまま)。'}</p>`,
+    `${over ? '<button class="btn" data-act="tgReset">いつもの設定に戻す</button>' : ''}<span style="flex:1"></span>
+     <button class="btn" data-act="closeSheet">キャンセル</button><button class="btn primary" data-act="tgSave">保存</button>`);
+}
+/** 臨時の課題を作る・直す */
+function openTaskEditor(id){
+  const t = id ? S.taskBy[id] : {title:'', date:S.today, time:'17:00', note:'', rule:{grades:['1'], include:[], exclude:[]}};
+  sheet = {kind:'task', id:id || '', rule:cloneRule(t.rule)};
+  openSheet(id ? '課題を編集' : '新しい課題', `
+    <label class="field"><span>課題の名前</span><input type="text" id="tTitle" maxlength="60" value="${esc(t.title)}" placeholder="例: 企画書"></label>
+    <div class="two">
+      <label class="field"><span>締切日</span><input type="date" id="tDate" value="${esc(t.date)}"></label>
+      <label class="field"><span>締切時刻</span><input type="time" id="tTime" value="${esc(t.time)}"></label>
+    </div>
+    <label class="field"><span>メモ<small>出し方など</small></span><input type="text" id="tNote" maxlength="500" value="${esc(t.note || '')}" placeholder="例: Teamsの課題チャネルに投稿"></label>
+    <div class="field"><span>出す人</span></div><div id="tPick">${pickerHtml(sheet.rule)}</div>`,
+    `${id ? '<button class="btn danger" data-act="taskDelete">削除</button>' : ''}<span style="flex:1"></span>
+     <button class="btn" data-act="closeSheet">キャンセル</button><button class="btn primary" data-act="taskSave">保存</button>`);
+}
+async function saveTaskSheet(){
+  const t = {id:sheet.id, title:$('#tTitle').value, date:$('#tDate').value, time:$('#tTime').value || '17:00', note:$('#tNote').value, rule:sheet.rule};
+  if (!t.title.trim()) return toast('課題の名前を入れてください', true);
+  if (!t.date) return toast('締切日を選んでください', true);
+  if (!activeMembers().some(m => inRule(m, t.rule))) return toast('出す人を1人以上選んでください', true);
+  if (await act('saveTask', t)) { if (S.taskId) chkCur.task = S.taskId; closeSheet(); render(); }
+}
+
 function closeSheet(){ sheet = null; $('#sheet').classList.remove('show'); $('#sheet').innerHTML = ''; }
 async function saveSheet(){
   const date = $('#eDate').value;
@@ -1356,6 +1485,24 @@ document.addEventListener('click', e => {
     const k = b.dataset.k, C = CHK[k], off = chkOff(k, chkCur[k]);
     if (!off && !confirm(`${C.opt(chkCur[k])} を「${C.what}なし」にしますか?(付けた印は残ります)`)) return;
     setChk(k, chkCur[k], '*', off ? '' : 'なし'); render();
+  }
+  else if (a === 'subMode') { subMode = b.dataset.k; tab = 'sub'; render(); }
+  else if (a === 'tgEdit') openTargetEditor(b.dataset.k, b.dataset.key || '');
+  else if (a === 'tgReset') act('saveTargets', sheet.chk, null, sheet.key).then(ok => ok && closeSheet());
+  else if (a === 'taskEdit') openTaskEditor(b.dataset.id || '');
+  else if (a === 'tgGrade' || a === 'tgMem') {
+    if (a === 'tgGrade') toggleGrade(sheet.rule, b.dataset.g); else toggleMem(sheet.rule, b.dataset.id);
+    $('#tPick').innerHTML = pickerHtml(sheet.rule);
+  }
+  else if (a === 'tgSave') {
+    sheet.rule.byWeek = $('#tgWeek').checked;
+    if (!activeMembers().some(m => inRule(m, sheet.rule)) && !confirm('出す人が0人になります。よろしいですか?')) return;
+    act('saveTargets', sheet.chk, sheet.rule, sheet.key).then(ok => ok && closeSheet());
+  }
+  else if (a === 'taskSave') saveTaskSheet();
+  else if (a === 'taskDelete') {
+    const n = Object.keys(S.chk.task[sheet.id] || {}).length;
+    if (confirm(`この課題を削除しますか?${n ? `\n付けた印 ${n}件も消えます。` : ''}`)) act('deleteTask', sheet.id).then(ok => ok && closeSheet());
   }
   else if (a === 'chkPrev' || a === 'chkNext') {
     const k = b.dataset.k, ks = CHK[k].keys(), n = ks.indexOf(chkCur[k]) + (a === 'chkPrev' ? -1 : 1);
