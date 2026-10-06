@@ -198,6 +198,7 @@ textarea{width:100%;min-height:100px;resize:vertical;line-height:1.6}
 .seg button.on{color:#fff;font-weight:700}
 .seg .s0.on{background:var(--s0)} .seg .s1.on{background:var(--s1)} .seg .s2.on{background:var(--s2)}
 .seg .s3.on{background:var(--s3)} .seg .s4.on{background:var(--s4)}
+.seg.seg2{grid-template-columns:1fr 1fr}
 /* タブレットでは2列に並べて、1画面に入る人数を倍にする */
 @media (min-width:900px){
   .persons{display:grid;grid-template-columns:1fr 1fr;gap:8px}
@@ -221,7 +222,7 @@ textarea{width:100%;min-height:100px;resize:vertical;line-height:1.6}
 /* ---------- 一覧 ---------- */
 /* 数字の札。大きな数字 → 日本語 → 小さな英字、の順に読ませる */
 .stats{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
-@media (min-width:560px){.stats{grid-template-columns:repeat(4,1fr)}}
+@media (min-width:560px){.stats{grid-template-columns:repeat(3,1fr)}}
 .stat{background:var(--plate);border-radius:16px;padding:14px 16px}
 .stat b{display:block;font:800 30px/1.05 var(--font-display);letter-spacing:-.03em}
 .stat b small{font-size:15px;margin-left:2px}
