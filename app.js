@@ -4,7 +4,7 @@
    どちらで動いているかは、Google が入れてくれる google.script があるかで見分ける */
 const IN_GAS = typeof google !== 'undefined' && !!(google.script && google.script.run);
 // プログラムの版。サーバー(Code.gs)の CODE_VERSION と同じにしておく
-const CODE_VERSION = '2026-10-07b';
+const CODE_VERSION = '2026-10-10b';
 
 /* ---------- 読み込み中の画面で止まったままにしない ----------
    思わぬエラーや、サーバーの返事が来ないときに、アイコンが回り続けるだけにならないよう、
@@ -77,6 +77,8 @@ let S = null;            // サーバーから取ってきたデータ
 let tab = 'att';
 let curDate = null;
 const chkCur = {};       // 提出チェックで開いている回(感想=締切日の水曜 / 提出物=活動日 / 臨時課題=課題ID)
+let lastGrp = 'att';     // 「出席」タブの中で最後に開いていたもの(出席/提出物/感想)
+const GRP = [['att', '出席'], ['sub', '提出物'], ['kan', '感想']];
 let subMode = 'sub';     // 提出物タブ: 毎回の提出物(sub) / 臨時の課題(task)
 let memoKind = '共有';   // 共有 / フィードバック / 個人
 const forms = {};        // メモ入力欄の中身(種類ごと)
@@ -217,9 +219,22 @@ function ingest(d){
   });
 }
 
+/**
+ * サーバーのほうが新しい版なら、画面のファイルを取り直して読み込み直す。
+ * スマホ(とくにホーム画面に追加したもの)は、前に読んだ画面をしばらく使い続けるため。
+ * 取り直しても同じ版なら(GitHubへの上げ忘れなど)、この起動中はもう試さない
+ */
+async function checkUpdate(sv){
+  if (IN_GAS || !sv || sv <= CODE_VERSION || Object.keys(pending).length || saving) return;
+  try { if (sessionStorage.getItem('updTried') === sv) return; sessionStorage.setItem('updTried', sv); } catch (e) { return; }
+  try { await Promise.all(['./', 'index.html', 'app.js', 'theme.js'].map(u => fetch(u, {cache:'reload'}))); } catch (e) {}
+  location.reload();
+}
+
 async function load(fresh){
   try {
     const d = await call('getAll', !!fresh);
+    checkUpdate(d.codeVersion);
     ingest(d);
     saveSnap(d);
     $('#tabs').hidden = false;
@@ -385,6 +400,7 @@ async function pollOnce(){
   if (!S || !TOKEN || document.hidden || busy || saving || Object.keys(pending).length) return;
   try {
     const r = await call('poll', S.ver);
+    checkUpdate(r.codeVersion);
     if (r.v === S.ver || busy || saving || Object.keys(pending).length) return;
     const d = await call('getAll');
     if (busy || saving || Object.keys(pending).length) return;   // 取り直すあいだに自分が保存を始めたら、その結果を優先
@@ -477,12 +493,14 @@ const CHK = {
 const taskDeadline = t => t ? Date.parse(`${t.date}T${t.time}:00+09:00`) : 0;
 /**
  * 出す人の決まり(学年+個別に足す−個別に外す)に、その部員が入るか。決まりが無ければ全員。
- * byWeek なら、A週の回(wk='A')はA班・B週の回はB班だけ。班の無い人と、A/B週でない回は分けない
+ * byWeek なら、A週の回(wk='A')はA班・B週の回はB班だけ。班の無い人と、A/B週でない回は分けない。
+ * 個別に足した人は、A週/B週の分け方より優先する(B週にA班の人を足せるように)
  */
 function inRule(m, rule, wk){
   if (!rule) return true;
   if (rule.exclude.includes(m.id)) return false;
-  if (!(rule.grades.includes(String(m.grade)) || rule.include.includes(m.id))) return false;
+  if (rule.include.includes(m.id)) return true;
+  if (!rule.grades.includes(String(m.grade))) return false;
   return !(rule.byWeek && wk && m.group && m.group !== wk);
 }
 /** 決まりを短い文に(例: 1年 +2年A −1年C ・A週はA班だけ) */
@@ -664,8 +682,13 @@ function picHtml(id){
 /* ---------- 描画 ---------- */
 function render(){
   $('#who').textContent = `${S.me.name}(${S.me.role})`;
-  document.querySelectorAll('#tabs button').forEach(b => b.classList.toggle('on', b.dataset.tab === tab));
-  $('#view').innerHTML = ({att:viewAtt, sub:() => viewChk(subMode), kan:() => viewChk('kan'), sum:viewSum, memo:viewMemo, set:viewSet})[tab]();
+  const inGrp = GRP.some(([k]) => k === tab);
+  if (inGrp) lastGrp = tab;
+  document.querySelectorAll('#tabs button').forEach(b => b.classList.toggle('on', b.dataset.tab === tab || (inGrp && b.dataset.tab === 'grp')));
+  // 上の段: 出席/提出物/感想の切り替えと、更新ボタン(スマホは上のバーが無いので、ここに置く)
+  const top = `<div class="topline">${inGrp ? `<div class="segtabs">${GRP.map(([k, l]) => `<button data-tab="${k}" class="${tab === k ? 'on' : ''}">${l}</button>`).join('')}</div>` : '<span class="grow"></span>'}
+    <button class="iconbtn reloadbtn" data-act="reload" title="最新の状態に更新" aria-label="更新">${icon('reload')}</button></div>`;
+  $('#view').innerHTML = top + ({att:viewAtt, sub:() => viewChk(subMode), kan:() => viewChk('kan'), sum:viewSum, memo:viewMemo, set:viewSet})[tab]();
   renderBell();
   if (tab === 'att' || tab === 'sub' || tab === 'kan') setSave(setSave.text || '', setSave.err);
   hydrateImages();
@@ -779,13 +802,21 @@ function viewChk(kind){
     h += `<h3 class="grade">${esc(g)}年<small>${list.length}人</small></h3><div class="persons">`;
     list.forEach(m => {
       const r = rec[m.id] || {};
-      h += `<div class="person"><div class="pname"><b>${esc(m.name)} ${grpChip(m.group)}</b>${r.by ? `<span class="stamp">記録: ${esc(r.by)}</span>` : ''}</div>
+      h += `<div class="person"><div class="pname"><b>${esc(m.name)} ${grpChip(m.group)}</b>${r.by ? `<span class="stamp">記録: ${esc(r.by)}</span>` : ''}
+        ${ed ? `<span class="pacts"><button class="linkbtn" data-act="chkDrop" data-k="${kind}" data-id="${esc(m.id)}" title="この${C.unit}の出す人から外す">外す</button></span>` : ''}</div>
         <div class="seg seg2">${['提出', '遅れ'].map((s, n) =>
           `<button class="s${n ? 1 : 0} ${r.status === s ? 'on' : ''}" data-act="cmark" data-k="${kind}" data-id="${esc(m.id)}" data-s="${s}" ${ed ? '' : 'disabled'}>${s}</button>`).join('')}</div></div>`;
     });
     h += `</div>`;
   });
-  if (!members.length) h += '<p class="empty">出す人がいません。「変更」から選んでください。</p>';
+  if (!members.length) h += '<p class="empty">出す人がいません。下から足すか、「変える」から選んでください。</p>';
+  const others = all.filter(m => !inRule(m, rule, wk));
+  if (others.length) {
+    h += `<details style="margin-top:12px"><summary class="small">出す人以外(${others.length}人)${ed ? ' ・押すとこの' + C.unit + 'に足す' : ''}</summary>
+      <div class="pick">${others.map(m => ed
+        ? `<button class="rep" data-act="chkAdd" data-k="${kind}" data-id="${esc(m.id)}">+ ${esc(m.name)}${m.group ? ` <small>${m.group}</small>` : ''}</button>`
+        : `<span class="rep">${esc(m.name)}</span>`).join('')}</div></details>`;
+  }
   if (ed && !C.noOff) h += `<div class="row" style="margin-top:14px"><button class="btn sm" data-act="chkOff" data-k="${kind}">この${C.unit}は${C.what}なしにする</button></div>`;
   return h;
 }
@@ -1089,11 +1120,31 @@ function goToMemo(id){
   if (el) { el.scrollIntoView({block:'center'}); el.classList.add('flash'); }
 }
 
-/** リアクション・返信は、画面を先に変えてから保存する(1〜2秒待たせないため) */
+/**
+ * メモ・ピン留め・返信・リアクションは、画面を先に変えてから裏で保存する(1〜2秒待たせないため)。
+ * 続けて押したときは、最後の返事だけで画面を作り直す(途中の古い返事で、先に変えた表示が戻らないように)。
+ * 失敗したら onFail を呼んで(書きかけを戻すなど)、最新の状態を取り直す
+ */
+let quietN = 0;
 async function quiet(fn, ...args){
-  try { ingest(await call(fn, ...args)); }
-  catch (e) { toast(errMsg(e), true); try { ingest(await call('getAll')); } catch (_) {} }
-  render();
+  const onFail = typeof args[args.length - 1] === 'function' ? args.pop() : null;
+  quietN++; busy++;
+  let d = null, err = null;
+  try { d = await call(fn, ...args); }
+  catch (e) { err = e; }
+  busy--;
+  if (err) {
+    toast(errMsg(err), true);
+    if (onFail) onFail();
+    try { d = await call('getAll'); } catch (_) {}
+  }
+  if (--quietN === 0 && d) { ingest(d); saveSnap(d); }
+  safeRender();
+}
+const nowText = () => { const d = new Date(), p = n => String(n).padStart(2, '0'); return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`; };
+function setReplies(){
+  S.repliesBy = {};
+  S.replies.forEach(r => (S.repliesBy[r.memoId] = S.repliesBy[r.memoId] || []).push(r));
 }
 function toggleReactLocal(id, e){
   const list = S.reactsBy[id] = S.reactsBy[id] || [];
@@ -1137,9 +1188,17 @@ async function saveMemoForm(){
     render();
     return;
   }
-  const ok = await act('saveMemo', {id:f.id, kind:f.kind, targetId:f.targetId, tag:f.tag, importance:f.importance,
-    date:f.date, body:f.body, images:f.images.map(im => im.id)});
-  if (ok) { forms[memoKind] = null; render(); }
+  const m = {id:f.id, kind:f.kind, targetId:f.targetId, tag:f.tag, importance:f.importance,
+    date:f.date, body:f.body, images:f.images.map(im => im.id)};
+  // 先に一覧へ出して入力欄を空にする。失敗したら書いた中身を入力欄に戻す
+  const kind = memoKind;
+  const target = m.kind === 'フィードバック' || (m.targetId && m.targetId !== '全体') ? S.byId[m.targetId] : null;
+  const local = {...m, targetId:target ? target.id : '全体', targetName:target ? target.name : '全体', updatedAt:''};
+  if (f.id) { const x = S.memos.find(x => x.id === f.id); if (x) Object.assign(x, local, {updatedAt:nowText()}); }
+  else S.memos.unshift(Object.assign(local, {id:'tmp' + Date.now(), createdAt:nowText(), authorEmail:S.me.email, authorName:S.me.name, pinned:false}));
+  forms[kind] = null;
+  render();
+  quiet('saveMemo', m, () => { forms[kind] = f; });
 }
 
 async function saveNoteForm(){
@@ -1322,12 +1381,13 @@ function openDayEditor(date){
   $('#sheet').classList.add('show');
 }
 /* ---------- 出す人を選ぶ ---------- */
-function pickerHtml(rule){
-  const n = activeMembers().filter(m => inRule(m, rule)).length;
-  let h = `<div class="small" style="margin-bottom:6px">学年を押すとその学年全員、名前を押すとその人だけを切り替えます。<b>${n}人</b></div>`;
+function pickerHtml(rule, wk){
+  const n = activeMembers().filter(m => inRule(m, rule, wk)).length;
+  let h = `<div class="small" style="margin-bottom:6px">学年を押すとその学年全員、名前を押すとその人だけを入れる/外す。${wk ? `<b>${wk}週</b>の回として表示しています。` : ''}<b>${n}人</b></div>
+    <div class="pick"><button class="rep" data-act="tgAll">全員</button><button class="rep" data-act="tgNone">だれもいない</button></div>`;
   byGrade(activeMembers()).forEach(([g, list]) => {
     h += `<div class="pick"><button class="rep ${rule.grades.includes(String(g)) ? 'on' : ''}" data-act="tgGrade" data-g="${esc(g)}">${esc(g)}年 全員</button>
-      ${list.map(m => `<button class="rep ${inRule(m, rule) ? 'on' : ''}" data-act="tgMem" data-id="${esc(m.id)}">${esc(m.name)}</button>`).join('')}</div>`;
+      ${list.map(m => `<button class="rep ${inRule(m, rule, wk) ? 'on' : ''}" data-act="tgMem" data-id="${esc(m.id)}">${esc(m.name)}${m.group ? ` <small>${m.group}</small>` : ''}</button>`).join('')}</div>`;
   });
   return h;
 }
@@ -1336,11 +1396,22 @@ function toggleGrade(rule, g){
   if (rule.grades.includes(String(g))) { rule.grades = rule.grades.filter(x => x !== String(g)); rule.include = rule.include.filter(id => !ids.includes(id)); }
   else { rule.grades.push(String(g)); rule.exclude = rule.exclude.filter(id => !ids.includes(id)); }
 }
-function toggleMem(rule, id){
+/** その人を入れる/外す。今入っていれば外し、入っていなければ(A週/B週で外れていても)入れる */
+function toggleMem(rule, id, wk){
   const m = S.byId[id];
-  const tog = (list, x) => list.includes(x) ? list.filter(y => y !== x) : list.concat([x]);
-  if (rule.grades.includes(String(m.grade))) rule.exclude = tog(rule.exclude, id);
-  else rule.include = tog(rule.include, id);
+  const del = (list, x) => list.filter(y => y !== x);
+  if (inRule(m, rule, wk)) {
+    rule.include = del(rule.include, id);
+    if (inRule(m, rule, wk)) rule.exclude = rule.exclude.concat([id]);
+  } else {
+    rule.exclude = del(rule.exclude, id);
+    if (!inRule(m, rule, wk)) rule.include = rule.include.concat([id]);
+  }
+}
+function setAll(rule, on){
+  rule.grades = on ? [...new Set(activeMembers().map(m => String(m.grade)))] : [];
+  rule.include = []; rule.exclude = [];
+  if (on) rule.byWeek = false;
 }
 const cloneRule = r => ({grades:[...(r ? r.grades : [])], include:[...(r ? r.include : [])], exclude:[...(r ? r.exclude : [])], byWeek:!!(r && r.byWeek)});
 function openSheet(title, body, foot){
@@ -1357,12 +1428,11 @@ function openTargetEditor(kind, key){
   const C = CHK[kind];
   const base = S.targets ? S.targets[kind] : null;
   const over = key && S.over[kind][key];
-  sheet = {kind:'target', chk:kind, key:key || '', rule:cloneRule(key ? C.target(key) : base)};
-  sheet.rule.byWeek = !!(key ? C.target(key) : base || {}).byWeek;
   const wk = key ? C.wk(key) : '';
+  sheet = {kind:'target', chk:kind, key:key || '', wk, rule:cloneRule(key ? C.target(key) : base)};
   openSheet(key ? `${esc(C.opt(key))} だけ` : `いつもの${C.ja}を出す人`, `
     ${key ? `<p class="small" style="margin-top:0">この${C.unit}だけ出す人を変えます。ほかの${C.unit}は「いつもの設定」のままです。</p>` : ''}
-    <div id="tPick">${pickerHtml(sheet.rule)}</div>
+    <div id="tPick">${pickerHtml(sheet.rule, wk)}</div>
     <div class="toggles"><label class="toggle"><span class="tx">A週はA班、B週はB班だけ<small>班の無い人(2年など)と、A/B週でない回は分けない${wk ? `。この回は${wk}週` : ''}</small></span>
       <input type="checkbox" class="sw" id="tgWeek" ${sheet.rule.byWeek ? 'checked' : ''}></label></div>
     <p class="muted small">${key ? '' : '学年で選んでおくと、新年度に学年が上がっても、その年の学年の人になります。変えると、これまでの回の提出率もこの人たちで数え直します(「この回だけ」変えた回はそのまま)。'}</p>`,
@@ -1372,7 +1442,7 @@ function openTargetEditor(kind, key){
 /** 臨時の課題を作る・直す */
 function openTaskEditor(id){
   const t = id ? S.taskBy[id] : {title:'', date:S.today, time:'17:00', note:'', rule:{grades:['1'], include:[], exclude:[]}};
-  sheet = {kind:'task', id:id || '', rule:cloneRule(t.rule)};
+  sheet = {kind:'task', id:id || '', wk:'', rule:cloneRule(t.rule)};
   openSheet(id ? '課題を編集' : '新しい課題', `
     <label class="field"><span>課題の名前</span><input type="text" id="tTitle" maxlength="60" value="${esc(t.title)}" placeholder="例: 企画書"></label>
     <div class="two">
@@ -1380,7 +1450,7 @@ function openTaskEditor(id){
       <label class="field"><span>締切時刻</span><input type="time" id="tTime" value="${esc(t.time)}"></label>
     </div>
     <label class="field"><span>メモ<small>出し方など</small></span><input type="text" id="tNote" maxlength="500" value="${esc(t.note || '')}" placeholder="例: Teamsの課題チャネルに投稿"></label>
-    <div class="field"><span>出す人</span></div><div id="tPick">${pickerHtml(sheet.rule)}</div>`,
+    <div class="field"><span>出す人</span></div><div id="tPick">${pickerHtml(sheet.rule, '')}</div>`,
     `${id ? '<button class="btn danger" data-act="taskDelete">削除</button>' : ''}<span style="flex:1"></span>
      <button class="btn" data-act="closeSheet">キャンセル</button><button class="btn primary" data-act="taskSave">保存</button>`);
 }
@@ -1414,13 +1484,15 @@ async function saveSheet(){
 /* ---------- 操作 ---------- */
 document.addEventListener('click', e => {
   const t = e.target.closest('[data-tab]');
-  if (t) { tab = t.dataset.tab; issued = null; render(); scrollTop(); return; }
+  if (t) { tab = t.dataset.tab === 'grp' ? lastGrp : t.dataset.tab; issued = null; render(); scrollTop(); return; }
   if (e.target.id === 'sheet') { closeSheet(); return; }     // 板の外側を押したら閉じる
   const b = e.target.closest('[data-act]');
   // リアクションの選択は、ほかの所を押したら閉じる
   if (pickerFor && !(b && ['react', 'picker'].includes(b.dataset.act))) { pickerFor = null; render(); }
   if (!b || b.disabled) return;
   const a = b.dataset.act;
+  // 送ったばかりで、まだサーバーから番号が付いていないメモ・返信
+  if (/^tmp/.test(b.dataset.id || '')) return toast('送信中です。少し待ってから押してください');
   const i = S ? S.days.findIndex(d => d.date === curDate) : -1;
   if (a === 'diagnose') { runDiagnose(); return; }   // 開けないときにも使うので、読み込み前でも動かす
   if (a === 'pageReload') { location.reload(); return; }
@@ -1472,10 +1544,17 @@ document.addEventListener('click', e => {
   else if (a === 'replySend') {
     const id = b.dataset.id, body = (replyDrafts[id] || '').trim();
     if (!body) return toast('返信を入力してください', true);
-    b.disabled = true;
-    act('addReply', id, body).then(ok => { if (ok) { delete replyDrafts[id]; render(); } });
+    S.replies.push({id:'tmp' + Date.now(), memoId:id, createdAt:nowText(), authorEmail:S.me.email, authorName:S.me.name, body});
+    setReplies();
+    delete replyDrafts[id];
+    render();
+    quiet('addReply', id, body, () => { replyDrafts[id] = body; });
   }
-  else if (a === 'replyDelete') { if (confirm('この返信を削除しますか?')) act('deleteReply', b.dataset.id); }
+  else if (a === 'replyDelete') {
+    if (!confirm('この返信を削除しますか?')) return;
+    S.replies = S.replies.filter(r => r.id !== b.dataset.id); setReplies(); render();
+    quiet('deleteReply', b.dataset.id);
+  }
   else if (a === 'viewImg') { const src = imgCache[b.dataset.id]; if (src) { $('#viewer img').src = src; $('#viewer').classList.add('show'); } }
   else if (a === 'prevDay' && i > 0) { curDate = S.days[i-1].date; render(); }
   else if (a === 'nextDay' && i < S.days.length - 1) { curDate = S.days[i+1].date; render(); }
@@ -1490,9 +1569,20 @@ document.addEventListener('click', e => {
   else if (a === 'tgEdit') openTargetEditor(b.dataset.k, b.dataset.key || '');
   else if (a === 'tgReset') act('saveTargets', sheet.chk, null, sheet.key).then(ok => ok && closeSheet());
   else if (a === 'taskEdit') openTaskEditor(b.dataset.id || '');
-  else if (a === 'tgGrade' || a === 'tgMem') {
-    if (a === 'tgGrade') toggleGrade(sheet.rule, b.dataset.g); else toggleMem(sheet.rule, b.dataset.id);
-    $('#tPick').innerHTML = pickerHtml(sheet.rule);
+  else if (['tgGrade', 'tgMem', 'tgAll', 'tgNone'].includes(a)) {
+    if (a === 'tgGrade') toggleGrade(sheet.rule, b.dataset.g);
+    else if (a === 'tgMem') toggleMem(sheet.rule, b.dataset.id, sheet.wk);
+    else { setAll(sheet.rule, a === 'tgAll'); const w = $('#tgWeek'); if (w) w.checked = sheet.rule.byWeek; }
+    $('#tPick').innerHTML = pickerHtml(sheet.rule, sheet.wk);
+  }
+  else if (a === 'chkAdd' || a === 'chkDrop') {
+    // チェックの画面から、その回の出す人を1人だけ足す/外す
+    const k = b.dataset.k, key = chkCur[k], C = CHK[k], m = S.byId[b.dataset.id];
+    if (a === 'chkDrop' && !confirm(`${m.name}さんを、この${C.unit}の出す人から外しますか?`)) return;
+    const rule = cloneRule(C.target(key));
+    toggleMem(rule, m.id, C.wk(key));
+    if (k === 'task') act('saveTask', Object.assign({}, S.taskBy[key], {rule}));
+    else act('saveTargets', k, rule, key);
   }
   else if (a === 'tgSave') {
     sheet.rule.byWeek = $('#tgWeek').checked;
@@ -1541,8 +1631,16 @@ document.addEventListener('click', e => {
       call('deleteMyNote', b.dataset.id).then(list => { S.myNotes = list; toast('削除しました'); render(); }).catch(err => toast(errMsg(err), true));
   }
   else if (a === 'memoCancel') { forms[memoKind] = null; render(); }
-  else if (a === 'memoPin') act('togglePin', b.dataset.id);
-  else if (a === 'memoDelete') { if (confirm('このメモを削除しますか?(付いている画像も消えます)')) act('deleteMemo', b.dataset.id); }
+  else if (a === 'memoPin') {
+    const x = S.memos.find(x => x.id === b.dataset.id);
+    if (x) { x.pinned = !x.pinned; render(); }
+    quiet('togglePin', b.dataset.id);
+  }
+  else if (a === 'memoDelete') {
+    if (!confirm('このメモを削除しますか?(付いている画像も消えます)')) return;
+    S.memos = S.memos.filter(x => x.id !== b.dataset.id); render();
+    quiet('deleteMemo', b.dataset.id);
+  }
   else if (a === 'addDays') {
     act('addDays', {start:$('#bStart').value, end:$('#bEnd').value, weekday:$('#bWd').value, type:$('#bType').value});
   }
@@ -1571,6 +1669,7 @@ document.addEventListener('change', async e => {
   const el = e.target;
   if (el.dataset.input === 'accRole' && accDraft) { accDraft[Number(el.dataset.i)].role = el.value; accDraft._dirty = true; render(); return; }
   if (el.dataset.f) { curForm()[el.dataset.f] = el.value; return; }
+  if (el.id === 'tgWeek' && sheet) { sheet.rule.byWeek = el.checked; $('#tPick').innerHTML = pickerHtml(sheet.rule, sheet.wk); return; }
   const c = el.dataset.change;
   if (!c) return;
   const mem = el.dataset.id && S.byId[el.dataset.id];
@@ -1613,16 +1712,20 @@ document.addEventListener('input', e => {
 });
 
 /* ---------- はじめに ---------- */
-$('#tabs').innerHTML = [['att', '出席'], ['sub', '提出物'], ['kan', '感想'], ['sum', '一覧'], ['memo', 'メモ'], ['set', '設定']]
-  .map(([k, l]) => `<button data-tab="${k}">${icon(k)}${l}</button>`).join('');
+$('#tabs').innerHTML = [['grp', '出席', 'att'], ['sum', '一覧'], ['memo', 'メモ'], ['set', '設定']]
+  .map(([k, l, ic]) => `<button data-tab="${k}">${icon(ic || k)}${l}</button>`).join('');
 $('#reload').innerHTML = icon('reload');
 async function doReload(){
+  if (doReload.on) return;
+  doReload.on = true;
   await flush();
   accDraft = null;
   $('#reload').disabled = true;
+  document.querySelectorAll('.reloadbtn').forEach(x => x.classList.add('spin'));
   toast('読み込み中…');
   await load(true);
   $('#reload').disabled = false;
+  doReload.on = false;
   toast('最新の状態にしました');
 }
 $('#reload').addEventListener('click', doReload);

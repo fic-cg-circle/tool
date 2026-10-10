@@ -200,6 +200,13 @@ textarea{width:100%;min-height:100px;resize:vertical;line-height:1.6}
 .seg .s3.on{background:var(--s3)} .seg .s4.on{background:var(--s4)}
 .seg.seg2{grid-template-columns:1fr 1fr}
 .pick{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0 12px}
+/* 画面のいちばん上の段: 出席/提出物/感想の切り替え+更新ボタン */
+.topline{display:flex;align-items:center;gap:8px;margin:0 0 6px}
+.topline .segtabs{flex:1;margin:0}
+.topline .reloadbtn{width:40px;height:40px;flex:none;margin-left:auto;background:var(--plate)}
+.reloadbtn.spin .ic{animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+@media (min-width:700px){ .topline .reloadbtn{display:none} .topline:not(:has(.segtabs)){display:none} }
 /* タブレットでは2列に並べて、1画面に入る人数を倍にする */
 @media (min-width:900px){
   .persons{display:grid;grid-template-columns:1fr 1fr;gap:8px}
